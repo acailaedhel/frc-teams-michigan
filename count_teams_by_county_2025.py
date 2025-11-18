@@ -1,24 +1,106 @@
 # count_teams_by_county_2025.py
 import os
+import sys
+import logging
 import requests
 import pandas as pd
 import geopandas as gpd
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend for windowed/headless environments
 import matplotlib.pyplot as plt
 import pgeocode
 import time
+import threading
+import queue
+try:
+    import tkinter as tk
+    from tkinter import scrolledtext, messagebox
+    TK_AVAILABLE = True
+except Exception:
+    TK_AVAILABLE = False
 
 # ----- CONFIG -----
 import os
-TBA_KEY = os.environ.get("TBA_KEY")
-HEADERS = {"X-TBA-Auth-Key": TBA_KEY}
-YEAR = 2025
+
+# Determine base path early so we can log and locate data both in script and bundled exe
+if getattr(sys, "frozen", False):
+    base_path = sys._MEIPASS
+else:
+    base_path = os.path.dirname(os.path.abspath(__file__))
+
+# Configure logging to a file in the base path so windowed executables produce a log
+log_file = os.path.join(base_path, "frc_teams.log")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s: %(message)s",
+    handlers=[
+        logging.FileHandler(log_file, encoding="utf-8"),
+    ],
+)
+
+COUNTY_SHAPEFILE = os.path.join(base_path, "Michigan_County.geojson")  # path to Michigan counties GeoJSON or shapefile
+
+# Globals that will be set when analysis starts
+TBA_KEY = None
+YEAR = None
+HEADERS = None
+OUTPUT_MAP = None
+OUTPUT_BAR = None
 STATE_FILTER = "MI"
-COUNTY_SHAPEFILE = "Michigan_County.geojson"  # path to Michigan counties GeoJSON or shapefile
-OUTPUT_MAP = "mi_frc_teams_by_county_2025.png"
-OUTPUT_BAR = "mi_frc_teams_by_county_2025_bar.png"
-# ------------------
 
 nomi = pgeocode.Nominatim("us")
+
+def get_user_inputs():
+    """Prompt user for TBA API key and year."""
+    print("\n" + "="*60)
+    print("FRC Teams by Michigan County Analysis")
+    print("="*60 + "\n")
+    # Helper that falls back to a simple Tk dialog when stdin is not available
+    def safe_input(prompt, default=None):
+        try:
+            return input(prompt)
+        except (RuntimeError, EOFError):
+            # likely running a windowed executable with no stdin; try GUI dialog
+            try:
+                import tkinter as tk
+                from tkinter import simpledialog
+                root = tk.Tk()
+                root.withdraw()
+                res = simpledialog.askstring("Input", prompt)
+                root.destroy()
+                if res is None:
+                    return "" if default is None else str(default)
+                return res
+            except Exception:
+                raise RuntimeError("No stdin available and GUI input failed.")
+
+    # Get TBA API key
+    tba_key = os.environ.get("TBA_KEY")
+    if not tba_key:
+        logging.info("No TBA_KEY env var found; prompting user for API key")
+        tba_key = safe_input("Enter your The Blue Alliance API Key\n(Get one at https://www.thebluealliance.com/account): ").strip()
+        if not tba_key:
+            logging.error("TBA API key was not provided by user; exiting")
+            print("ERROR: TBA API key is required!")
+            sys.exit(1)
+    else:
+        logging.info("Using TBA_KEY from environment variable")
+        print(f"✓ Using TBA_KEY from environment variable")
+
+    # Get year (allow default)
+    while True:
+        try:
+            year_input = safe_input("\nEnter the competition year (default 2025): ").strip()
+            year = int(year_input) if year_input else 2025
+            if year < 2000 or year > 2100:
+                print("Please enter a reasonable year between 2000 and 2100.")
+                continue
+            break
+        except ValueError:
+            print("Please enter a valid year (e.g., 2025).")
+
+    logging.info(f"User selected year: {year}")
+    return tba_key, year
 
 def get_mi_district_event_keys(year):
     # Optional: list known FIM district event keys manually, or query TBA for events in Michigan
@@ -57,7 +139,22 @@ def zip_to_county(zipcode):
     county = county.replace(" County", "").strip()
     return county
 
-def main():
+def main(tba_key=None, year=None):
+    global TBA_KEY, YEAR, HEADERS, OUTPUT_MAP, OUTPUT_BAR
+    
+    # If called with no args, prompt for input
+    if tba_key is None or year is None:
+        tba_key, year = get_user_inputs()
+    
+    # Set globals so helper functions can access them
+    TBA_KEY = tba_key
+    YEAR = year
+    HEADERS = {"X-TBA-Auth-Key": TBA_KEY}
+    OUTPUT_MAP = f"mi_frc_teams_by_county_{YEAR}.png"
+    OUTPUT_BAR = f"mi_frc_teams_by_county_{YEAR}_bar.png"
+    
+    logging.info(f"Starting analysis for year {YEAR}")
+    
     # 1) find Michigan events in 2025 season
     event_keys = get_mi_district_event_keys(YEAR)
     print(f"Found {len(event_keys)} MI events in {YEAR}")
@@ -175,7 +272,37 @@ def main():
     print(county_counts.sort_values("team_count", ascending=False).head(10))
 
     # 6) load Michigan counties shapefile/geojson
-    gdf_counties = gpd.read_file(COUNTY_SHAPEFILE)
+    try:
+        gdf_counties = gpd.read_file(COUNTY_SHAPEFILE)
+        logging.info(f"Loaded county geometry via geopandas.read_file: {COUNTY_SHAPEFILE}")
+    except Exception as e:
+        logging.warning(f"geopandas.read_file failed: {e}. Attempting JSON+shapely fallback.")
+        # Fallback: load GeoJSON manually to avoid fiona/pyogrio/GDAL dependency issues
+        try:
+            import json
+            from shapely.geometry import shape
+            with open(COUNTY_SHAPEFILE, 'r', encoding='utf-8') as fh:
+                geo = json.load(fh)
+            features = geo.get('features') if isinstance(geo, dict) else None
+            if not features:
+                raise RuntimeError('GeoJSON does not contain FeatureCollection')
+            rows = []
+            for feat in features:
+                props = feat.get('properties', {})
+                geom = feat.get('geometry')
+                try:
+                    geom_obj = shape(geom) if geom else None
+                except Exception:
+                    geom_obj = None
+                # put geometry and properties together
+                props['geometry'] = geom_obj
+                rows.append(props)
+            gdf_counties = gpd.GeoDataFrame(rows, geometry='geometry', crs='EPSG:4326')
+            logging.info('Loaded county geometries via JSON+shapely fallback')
+        except Exception as e2:
+            logging.exception('Failed to load county GeoJSON via fallback')
+            raise RuntimeError('Failed to load county geometry: ' + str(e2))
+
     # Ensure a county name field exists - try common fields
     name_fields = ["NAME", "NAME10", "COUNTYNAME", "county", "County", "Name"]
     county_name_field = next((f for f in name_fields if f in gdf_counties.columns), None)
@@ -201,11 +328,143 @@ def main():
             ax.text(centroid.x, centroid.y, str(int(row["team_count"])), 
                    fontsize=9, ha='center', va='center', fontweight='bold', color='black')
     
-    ax.set_title("Number of FRC teams by Michigan county — 2025 REEFSCAPE season", fontsize=14)
+    ax.set_title(f"Number of FRC teams by Michigan county — {YEAR} season", fontsize=14)
     ax.axis("off")
     plt.tight_layout()
     plt.savefig(OUTPUT_MAP, dpi=300)
-    print(f"Saved map to {OUTPUT_MAP}")
+    print(f"✓ Saved map to {OUTPUT_MAP}")
+    
+    print("\n" + "="*60)
+    print("Analysis complete!")
+    print("="*60)
+    print(f"Output files:")
+    print(f"  - {GUESS_CSV} (review file with guessed ZIP codes)")
+    print(f"  - {OUTPUT_MAP} (choropleth map)")
+    print("="*60 + "\n")
+
+def run_with_gui():
+    """Run the analysis with a Tkinter GUI status window."""
+    if not TK_AVAILABLE:
+        print("Tkinter not available; running in console mode.")
+        main()
+        return
+
+    q = queue.Queue()
+
+    class QueueHandler(logging.Handler):
+        def emit(self, record):
+            try:
+                msg = self.format(record)
+                q.put(msg + "\n")
+            except Exception:
+                pass
+
+    # Add the queue handler to the root logger
+    qh = QueueHandler()
+    qh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s"))
+    logging.getLogger().addHandler(qh)
+
+    root = tk.Tk()
+    root.title("FRC Teams — Michigan County Analysis")
+    root.geometry("900x700")
+
+    # Input frame
+    frm = tk.Frame(root)
+    frm.pack(padx=10, pady=10, fill="x")
+
+    tk.Label(frm, text="TBA API Key:", font=("Arial", 10)).grid(row=0, column=0, sticky="w", pady=5)
+    key_var = tk.StringVar(value=os.environ.get("TBA_KEY", ""))
+    key_entry = tk.Entry(frm, textvariable=key_var, width=60, show="*", font=("Arial", 10))
+    key_entry.grid(row=0, column=1, sticky="we", padx=5)
+    frm.columnconfigure(1, weight=1)
+
+    tk.Label(frm, text="Year:", font=("Arial", 10)).grid(row=1, column=0, sticky="w", pady=5)
+    year_var = tk.StringVar(value="2025")
+    year_entry = tk.Entry(frm, textvariable=year_var, width=10, font=("Arial", 10))
+    year_entry.grid(row=1, column=1, sticky="w", padx=5)
+
+    btn_frame = tk.Frame(root)
+    btn_frame.pack(padx=10, pady=5, fill="x")
+    
+    start_btn = tk.Button(btn_frame, text="Start Analysis", width=15, font=("Arial", 10), bg="#4CAF50", fg="white")
+    start_btn.pack(side="left", padx=5)
+    
+    close_btn = tk.Button(btn_frame, text="Close", width=15, font=("Arial", 10), state="disabled", command=root.destroy)
+    close_btn.pack(side="left", padx=5)
+
+    # Status text widget
+    tk.Label(root, text="Status:", font=("Arial", 10, "bold")).pack(anchor="w", padx=10, pady=(10, 0))
+    st = scrolledtext.ScrolledText(root, width=100, height=25, state="disabled", font=("Courier", 9))
+    st.pack(padx=10, pady=5, fill="both", expand=True)
+
+    def append_text(s):
+        st.configure(state="normal")
+        st.insert("end", s)
+        st.see("end")
+        st.configure(state="disabled")
+        root.update()
+
+    def poll_queue():
+        while True:
+            try:
+                s = q.get_nowait()
+            except queue.Empty:
+                break
+            append_text(s)
+        root.after(200, poll_queue)
+
+    def worker(tkey, tyr):
+        try:
+            if tkey:
+                os.environ["TBA_KEY"] = tkey
+            append_text(f"Using year: {tyr}\n")
+            main(tkey, int(tyr))
+            logging.info("Analysis finished successfully.")
+            append_text("\n" + "="*60 + "\n")
+            append_text("ANALYSIS COMPLETE!\n")
+            append_text("="*60 + "\n")
+            root.after(0, lambda: close_btn.config(state="normal"))
+            root.after(500, lambda: messagebox.showinfo("Complete", "Analysis complete! You can now close this window."))
+        except Exception as e:
+            logging.exception(f"Error during analysis: {e}")
+            append_text(f"\nERROR: {e}\n")
+            root.after(0, lambda: close_btn.config(state="normal"))
+
+    def on_start():
+        start_btn.config(state="disabled")
+        key_entry.config(state="disabled")
+        year_entry.config(state="disabled")
+        key = key_var.get().strip()
+        yr = year_var.get().strip() or "2025"
+        if not key:
+            messagebox.showerror("Error", "Please enter a TBA API key or set TBA_KEY environment variable.")
+            start_btn.config(state="normal")
+            key_entry.config(state="normal")
+            year_entry.config(state="normal")
+            return
+        append_text("="*60 + "\n")
+        append_text("Starting FRC Teams Analysis...\n")
+        append_text("="*60 + "\n\n")
+        t = threading.Thread(target=worker, args=(key, yr), daemon=True)
+        t.start()
+        poll_queue()
+
+    start_btn.config(command=on_start)
+
+    root.mainloop()
 
 if __name__ == "__main__":
-    main()
+    # Use GUI if frozen (windowed exe) or if stdin is not a TTY (not an interactive terminal)
+    if getattr(sys, "frozen", False) or not sys.stdin or not sys.stdin.isatty():
+        run_with_gui()
+    else:
+        try:
+            main()
+        except KeyboardInterrupt:
+            print("\n\nCancelled by user.")
+            sys.exit(0)
+        except Exception as e:
+            print(f"\n\nERROR: {e}")
+            import traceback
+            traceback.print_exc()
+            sys.exit(1)
